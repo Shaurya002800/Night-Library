@@ -22,16 +22,18 @@ def effective_status(row, as_of):
     return row['pass_status']
 
 
-def attendance_rows(db, session_id, demo, hostel=None):
-    rows=db.rows('''SELECT a.*,s.student_name,s.hostel_id,s.room_no,h.hostel_name,
+def attendance_rows(db, session_id, demo, hostel=None, student=None):
+    rows=db.rows('''SELECT a.*,s.student_name,COALESCE(p.issued_hostel_id,s.hostel_id) AS hostel_id,s.room_no,h.hostel_name,
         p.pass_id,p.pass_token,p.pass_status,p.issued_at,p.expiry_time,
         r.arrival_time,r.verified_by,l.closing_time
         FROM night_attendance a JOIN student s ON s.student_id=a.student_id
-        JOIN hostel h ON h.hostel_id=s.hostel_id
         JOIN library_session l ON l.session_id=a.session_id
         LEFT JOIN exit_pass p ON p.attendance_id=a.attendance_id
         LEFT JOIN hostel_return r ON r.pass_id=p.pass_id AND r.verification_status='VERIFIED'
-        WHERE a.session_id=:sid ORDER BY s.student_id''',dict(sid=session_id))
+        JOIN hostel h ON h.hostel_id=COALESCE(p.issued_hostel_id,s.hostel_id)
+        WHERE a.session_id=:sid AND (:student IS NULL OR a.student_id=:student)
+        AND (:hostel IS NULL OR COALESCE(p.issued_hostel_id,s.hostel_id)=:hostel)
+        ORDER BY s.student_id''',dict(sid=session_id,student=student,hostel=hostel))
     for r in rows:
         r['effective_status']=effective_status(r,event_time(r,demo))
         r['return_status']=('LATE RETURN' if dt(r['arrival_time'])>dt(r['closing_time']) else 'RETURNED') if r['arrival_time'] else ('ABSENT' if r['attendance_status']=='ABSENT' else ('IN LIBRARY' if not r['pass_token'] else r['effective_status']+' · RETURN PENDING'))
@@ -87,7 +89,7 @@ def verify_pass(token, staff_id, demo=False, at=None):
                 return message.startswith('VERIFIED:'),message
             finally:
                 cur.close()
-        p=db.one('''SELECT p.*,s.student_id,s.hostel_id FROM exit_pass p
+        p=db.one('''SELECT p.*,s.student_id,p.issued_hostel_id AS hostel_id FROM exit_pass p
           JOIN night_attendance a ON a.attendance_id=p.attendance_id
           JOIN student s ON s.student_id=a.student_id WHERE p.pass_token=:token''',dict(token=token))
         if not p:
@@ -113,10 +115,10 @@ def verify_pass(token, staff_id, demo=False, at=None):
 
 
 def pass_details(db,token):
-    return db.one('''SELECT p.*,s.student_id,s.student_name,s.hostel_id,s.room_no,h.hostel_name,
+    return db.one('''SELECT p.*,s.student_id,s.student_name,p.issued_hostel_id AS hostel_id,s.room_no,h.hostel_name,
         a.session_id,l.closing_time,r.arrival_time,r.verified_by
         FROM exit_pass p JOIN night_attendance a ON a.attendance_id=p.attendance_id
-        JOIN student s ON s.student_id=a.student_id JOIN hostel h ON h.hostel_id=s.hostel_id
+        JOIN student s ON s.student_id=a.student_id JOIN hostel h ON h.hostel_id=p.issued_hostel_id
         JOIN library_session l ON l.session_id=a.session_id
         LEFT JOIN hostel_return r ON r.pass_id=p.pass_id AND r.verification_status='VERIFIED'
         WHERE p.pass_token=:token''',dict(token=token))

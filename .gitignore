@@ -6,3 +6,7 @@ instance/*
 !instance/.gitkeep
 tmp/
 *.pyc
+.env.*
+!.env.example
+!.env.production.example
+oracle-verification.json

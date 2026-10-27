@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block title %}{{ code }}{% endblock %}{% block content %}<section class="panel error-panel"><div class="eyebrow">REQUEST {{ code }}</div><h1>{{ 'Access restricted' if code==403 else 'Could not complete this request' }}</h1><p>{{ message }}</p><a class="button" href="{{ url_for('index') }}">Back to workspace →</a></section>{% endblock %}

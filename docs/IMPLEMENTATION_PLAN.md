@@ -43,3 +43,8 @@ Prototype login uses one environment-configured shared password and synthetic us
 
 ## Deferred production work
 Institution-approved identity and attendance integration, HTTPS deployment, rate limiting, dedicated least-privilege Oracle grants, restricted audit access, retention policy and operational monitoring. QR camera scanning is optional progressive enhancement; USB scanners/paste work everywhere. Real Oracle test evidence must come from an actual Oracle execution.
+
+
+## Hardening revision (27 October 2026)
+
+The original prototype boundary above is superseded for accounts, source ingestion and deployment configuration by the user's hardening request. Implemented: individual hashed accounts, revocable sessions and OIDC binding, HMAC attendance API, audited directory editing/archival, pass-hostel snapshots, hardened production settings, Oracle deployment migrations/grants/verification runner, Gunicorn/container/TLS configuration and additional tests. Approval-dependent infrastructure, actual provider connection, physical-device QA and real rollout are explicitly deferred at the user's direction. `DEPLOYMENT.md` is the current release handoff; the earlier prototype assumptions are retained as design history.

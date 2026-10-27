@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import sqlite3
+import threading
+_POOL_LOCK=threading.Lock()
 from flask import current_app
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -52,9 +54,22 @@ def connect(write=False):
         cfg = current_app.config
         if not all(cfg.get(k) for k in ('DB_USER', 'DB_PASSWORD', 'DB_DSN')):
             raise RuntimeError('Oracle credentials are missing. Configure DB_USER, DB_PASSWORD and DB_DSN in .env.')
-        conn = oracledb.connect(user=cfg['DB_USER'], password=cfg['DB_PASSWORD'], dsn=cfg['DB_DSN'])
+        with _POOL_LOCK:
+            pool=current_app.extensions.get('oracle_pool')
+            if pool is None:
+                wallet={}
+                if cfg.get('DB_WALLET_PATH'):
+                    wallet=dict(wallet_location=cfg['DB_WALLET_PATH'],wallet_password=cfg.get('DB_WALLET_PASSWORD') or None)
+                pool=oracledb.create_pool(user=cfg['DB_USER'],password=cfg['DB_PASSWORD'],dsn=cfg['DB_DSN'],
+                    min=1,max=cfg.get('DB_POOL_MAX',8),increment=1,
+                    getmode=oracledb.POOL_GETMODE_TIMEDWAIT,wait_timeout=5000,timeout=300,ssl_server_dn_match=True,**wallet)
+                current_app.extensions['oracle_pool']=pool
+        conn=pool.acquire()
+        conn.call_timeout=15000
         cur = conn.cursor()
         cur.execute("ALTER SESSION SET TIME_ZONE = '+05:30'")
+        if cfg.get('DB_SCHEMA'):
+            cur.execute('ALTER SESSION SET CURRENT_SCHEMA = '+cfg['DB_SCHEMA'].upper())
         cur.close()
     else:
         path = Path(current_app.config['SQLITE_PATH'])

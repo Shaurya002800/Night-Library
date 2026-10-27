@@ -7,30 +7,51 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import time
+import logging
 from dotenv import load_dotenv
 from flask import Flask, abort, flash, g, redirect, render_template, request, send_file, session, url_for, Response
 import qrcode
 from nightlibrary.db import ROOT, connect, dt, initialize, now
 from nightlibrary.service import RuleError, attendance_rows, effective_status, event_time, issue_pass, pass_details, sessions, verify_pass
 
+from nightlibrary.config import settings, validate
+from nightlibrary.auth import (migrate_local,seed_demo_accounts,demo_account,authenticate,
+    begin_session,current_user,revoke_session,change_password)
+from nightlibrary.security import consume_limit,audit as security_audit,digest
 load_dotenv()
 
 def create_app(test_config=None):
     app=Flask(__name__)
-    app.config.update(SECRET_KEY=os.getenv('FLASK_SECRET_KEY') or secrets.token_hex(32),
-        DATABASE_BACKEND=os.getenv('DATABASE_BACKEND','sqlite').lower(),
-        SQLITE_PATH=os.getenv('SQLITE_PATH',str(ROOT/'instance/night_library.db')),
-        DEMO_MODE=os.getenv('DEMO_MODE','true').lower()=='true',
-        DEMO_PASSWORD=os.getenv('DEMO_PASSWORD','library-demo'),
-        DB_USER=os.getenv('DB_USER'),DB_PASSWORD=os.getenv('DB_PASSWORD'),DB_DSN=os.getenv('DB_DSN'),
-        SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',
-        PERMANENT_SESSION_LIFETIME=timedelta(hours=4),MAX_CONTENT_LENGTH=64*1024)
+    app.config.update(settings())
     if test_config:
         app.config.update(test_config)
-    if app.config['DATABASE_BACKEND'] not in ('sqlite','oracle'):
-        raise RuntimeError('DATABASE_BACKEND must be sqlite or oracle.')
+    validate(app.config)
+    app.config['SESSION_COOKIE_SECURE']=app.config['APP_ENV']=='production'
+    if app.config['APP_ENV']=='production':
+        app.config['DEBUG']=False
+        app.logger.setLevel(logging.INFO)
+    if app.config['PROXY_HOPS']:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app=ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=0,x_port=0,x_prefix=0)
     with app.app_context():
-        initialize()
+        if app.config['APP_ENV']!='production':
+            initialize()
+            migrate_local()
+            seed_demo_accounts()
+        else:
+            with connect() as db:
+                version=db.one('SELECT version FROM app_migration WHERE version=2')
+                if not version or version['version']!=2:
+                    raise RuntimeError('Apply the hardening database migration before starting production.')
+                owner=(app.config.get('DB_SCHEMA') or app.config['DB_USER']).upper()
+                units=db.one("SELECT COUNT(*) n FROM all_objects WHERE owner=:owner AND status='VALID' AND object_name IN ('PR_GENERATE_EXIT_PASS','PR_VERIFY_HOSTEL_RETURN','PR_GENERATE_UNRETURNED_REPORT','FN_CHECK_PASS_STATUS','FN_GET_STUDENT_RETURN_STATUS')",dict(owner=owner))
+                if units['n']!=5:
+                    raise RuntimeError('Required Oracle procedures/functions are missing or invalid.')
+    from nightlibrary.cli import register_cli
+    register_cli(app)
+    from nightlibrary.integrations import register_integrations
+    register_integrations(app)
 
     @app.template_filter('time')
     def time_format(value, fmt='%d %b, %I:%M %p'):
@@ -51,77 +72,111 @@ def create_app(test_config=None):
     @app.before_request
     def prepare():
         g.user=None
+        g.request_id=secrets.token_hex(12)
+        g.request_started=time.monotonic()
         if request.endpoint=='static':
             return
+        if app.config['APP_ENV']=='production' and not request.is_secure and request.endpoint not in ('health','readiness'):
+            abort(400,description='HTTPS is required.')
+        if request.endpoint=='attendance_webhook':
+            return  # Independently authenticated by HMAC; browser cookies are ignored.
+        g.user=current_user()
         if 'csrf' not in session:
             session['csrf']=secrets.token_hex(24)
         if request.method=='POST' and not secrets.compare_digest(session['csrf'],request.form.get('csrf','')):
             abort(400,description='The form expired. Reload the page and try again.')
-        ident=session.get('identity')
-        if ident:
-            with connect() as db:
-                if ident['kind']=='student':
-                    row=db.one("SELECT * FROM student WHERE student_id=:id AND student_status='ACTIVE'",dict(id=ident['id']))
-                    if row:
-                        g.user=dict(id=row['student_id'],name=row['student_name'],role='STUDENT',hostel_id=row['hostel_id'])
-                else:
-                    row=db.one("SELECT * FROM staff WHERE staff_id=:id AND is_active='Y'",dict(id=ident['id']))
-                    if row:
-                        g.user=dict(id=row['staff_id'],name=row['staff_name'],role=row['staff_role'],hostel_id=row['hostel_id'])
-            if not g.user:
-                session.pop('identity',None)
+        if request.endpoint=='verify' and request.method=='POST' and g.user:
+            if not consume_limit('verify:'+g.user['username'],60,60):
+                abort(429,description='Too many verification attempts. Try again in a minute.')
 
     @app.after_request
     def headers(response):
         response.headers['X-Content-Type-Options']='nosniff'
         response.headers['X-Frame-Options']='DENY'
-        response.headers['Referrer-Policy']='same-origin'
+        response.headers['Referrer-Policy']='no-referrer'
+        response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        response.headers['Permissions-Policy']='camera=(self), microphone=(), geolocation=()'
+        response.headers['X-Request-ID']=getattr(g,'request_id','')
+        if app.config['APP_ENV']=='production':
+            response.headers['Strict-Transport-Security']='max-age=31536000'
+        if request.endpoint!='static':
+            app.logger.info('request id=%s endpoint=%s method=%s status=%s duration_ms=%d',
+                getattr(g,'request_id',''),request.endpoint,request.method,response.status_code,
+                int((time.monotonic()-getattr(g,'request_started',time.monotonic()))*1000))
         if request.endpoint!='static':
             response.headers['Cache-Control']='no-store'
         return response
 
     @app.context_processor
     def context():
-        return dict(user=getattr(g,'user',None),csrf=session.get('csrf'),demo=app.config['DEMO_MODE'],backend=app.config['DATABASE_BACKEND'].upper())
+        return dict(user=getattr(g,'user',None),csrf=session.get('csrf'),demo=app.config['DEMO_MODE'],backend=app.config['DATABASE_BACKEND'].upper(),auth_mode=app.config['AUTH_MODE'],production=app.config['APP_ENV']=='production')
 
     @app.errorhandler(400)
     @app.errorhandler(403)
     @app.errorhandler(404)
     def http_error(err):
+        from werkzeug.exceptions import SecurityError
+        if isinstance(err,SecurityError):
+            return 'Invalid Host header.',400
         return render_template('error.html',code=err.code,message=err.description),err.code
+
+    @app.errorhandler(RuleError)
+    def rule_error(err):
+        return render_template('error.html',code=400,message=str(err)),400
 
     @app.errorhandler(Exception)
     def unexpected(err):
         from werkzeug.exceptions import HTTPException
         if isinstance(err,HTTPException):
             return err
-        app.logger.exception('Request failed')
+        app.logger.error('request_failed id=%s endpoint=%s error_type=%s',getattr(g,'request_id',''),request.endpoint,type(err).__name__)
         return render_template('error.html',code=503,message='The database operation could not be completed. Check your local database configuration and server log.'),503
 
     @app.route('/login',methods=['GET','POST'])
     def login():
         if request.method=='POST':
-            name=request.form.get('username','').strip()
+            if app.config['AUTH_MODE']=='oidc':
+                abort(403,description='Use institutional sign-in.')
+            name=request.form.get('username','').strip().lower()[:80]
             password=request.form.get('password','')
-            with connect() as db:
-                row=db.one("SELECT student_id FROM student WHERE student_id=:id AND student_status='ACTIVE'",dict(id=name.upper()))
-                kind='student'
-                if not row:
-                    row=db.one("SELECT staff_id FROM staff WHERE username=:name AND is_active='Y'",dict(name=name))
-                    kind='staff'
-            if row and secrets.compare_digest(password,app.config['DEMO_PASSWORD']):
-                session.clear()
-                session['identity']=dict(kind=kind,id=row.get('student_id') or row.get('staff_id'))
-                session['csrf']=secrets.token_hex(24)
-                session.permanent=True
+            if not consume_limit('login-ip:'+request.remote_addr,30) or not consume_limit('login-user:'+name,10):
+                abort(429,description='Too many login attempts. Try again in 15 minutes.')
+            account=authenticate(name,password) if len(password)<=256 else None
+            if account:
+                begin_session(account)
                 return redirect(url_for('index'))
+            with connect(write=True) as db:
+                security_audit(db,'LOGIN_FAILED','anonymous','AUTH_ACCOUNT',digest(name),'Invalid credentials')
             flash('The username or password is incorrect.','error')
         return render_template('login.html')
 
     @app.post('/logout')
     def logout():
+        revoke_session()
         session.clear()
         return redirect(url_for('login'))
+
+    @app.route('/account/password',methods=['GET','POST'])
+    @roles()
+    def password():
+        if app.config['AUTH_MODE']=='oidc':
+            abort(403,description='Manage your password through your institutional provider.')
+        if request.method=='POST':
+            if not consume_limit('password:'+g.user['username'],5):
+                abort(429)
+            if not authenticate(g.user['username'],request.form.get('current_password','')):
+                flash('Your current password is incorrect.','error')
+            elif request.form.get('new_password')!=request.form.get('confirm_password'):
+                flash('The new passwords do not match.','error')
+            else:
+                try:
+                    change_password(g.user['username'],request.form.get('new_password',''))
+                    session.clear()
+                    flash('Password changed. Sign in again. All previous sessions were revoked.','success')
+                    return redirect(url_for('login'))
+                except ValueError as exc:
+                    flash(str(exc),'error')
+        return render_template('password.html')
 
     def selected(db):
         all_sessions=sessions(db)
@@ -166,7 +221,7 @@ def create_app(test_config=None):
             all_sessions=sessions(db)
             rows=[]
             for s in all_sessions:
-                rows.extend(r for r in attendance_rows(db,s['session_id'],app.config['DEMO_MODE']) if r['student_id']==g.user['id'])
+                rows.extend(attendance_rows(db,s['session_id'],app.config['DEMO_MODE'],student=g.user['id']))
         return render_template('student.html',sessions=all_sessions,rows=rows)
 
     def authorized_pass(token):
@@ -211,6 +266,8 @@ def create_app(test_config=None):
     @app.route('/attendance',methods=['GET','POST'])
     @roles('ADMIN','LIBRARY_STAFF')
     def attendance():
+        if request.method=='POST' and app.config['APP_ENV']=='production':
+            abort(403,description='Production attendance must arrive through the approved integration endpoint.')
         if request.method=='POST':
             try:
                 sid=int(request.form['session_id'])
@@ -236,6 +293,7 @@ def create_app(test_config=None):
                         raise RuleError('Attendance is already recorded for this student and session.')
                     id_expr='ATTENDANCE_SEQ.NEXTVAL' if db.oracle else '(SELECT COALESCE(MAX(attendance_id),0)+1 FROM night_attendance)'
                     db.write(f'INSERT INTO night_attendance VALUES({id_expr},:student,:sid,:scan,:status)',dict(student=student['student_id'],sid=sid,scan=scan,status=status))
+                    security_audit(db,'ATTENDANCE_MANUAL',g.user['username'],'NIGHT_ATTENDANCE',student['student_id'],f'Session {sid}; {status}')
                 flash('Attendance recorded.','success')
                 return redirect(url_for('attendance',session_id=sid))
             except (ValueError,KeyError,sqlite3.IntegrityError) as err:
@@ -270,6 +328,7 @@ def create_app(test_config=None):
                             raise RuleError('A session already exists for this date.')
                         expr='LIBRARY_SESSION_SEQ.NEXTVAL' if db.oracle else '(SELECT COALESCE(MAX(session_id),1000)+1 FROM library_session)'
                         db.write(f"INSERT INTO library_session VALUES({expr},:day,:start,:deadline,:close,'SCHEDULED')",dict(day=start.replace(hour=0,minute=0,second=0) if db.oracle else start.date().isoformat(),start=start,deadline=deadline,close=close))
+                    security_audit(db,'SESSION_UPDATED' if request.form.get('action')=='status' else 'SESSION_CREATED',g.user['username'],'LIBRARY_SESSION',request.form.get('session_id','new'))
                 flash('Session saved.','success')
                 return redirect(url_for('manage_sessions'))
             except (ValueError,KeyError,sqlite3.IntegrityError) as err:
@@ -310,26 +369,41 @@ def create_app(test_config=None):
             try:
                 f=request.form
                 kind=f['kind']
+                required = {
+                    'hostel': {'hostel_id':10,'name':100},
+                    'student': {'student_id':12,'name':80,'program':60,'room':20},
+                    'staff': {'staff_id':10,'name':80,'username':40},
+                }
+                if kind not in required:
+                    raise RuleError('Unknown record type.')
+                for field, maximum in required[kind].items():
+                    if not f.get(field,'').strip() or len(f[field].strip()) > maximum:
+                        raise RuleError('Check required fields and maximum field lengths.')
                 with connect(write=True) as db:
                     if kind=='hostel':
                         capacity=int(f['capacity'])
                         if capacity<=0 or f['hostel_type'] not in ('MEN','WOMEN','OTHER'):
                             raise RuleError('Enter a valid capacity and hostel type.')
-                        db.write("INSERT INTO hostel VALUES(:id,:name,:type,:capacity,'ACTIVE')",dict(id=f['hostel_id'].strip().upper()[:10],name=f['name'].strip()[:100],type=f['hostel_type'],capacity=capacity))
+                        db.write("INSERT INTO hostel VALUES(:id,:name,:type,:capacity,'ACTIVE')",dict(id=f['hostel_id'].strip().upper(),name=f['name'].strip(),type=f['hostel_type'],capacity=capacity))
                     elif kind=='student':
                         year=int(f['year'])
                         if not 1<=year<=4:
                             raise RuleError('Year of study must be between 1 and 4.')
                         if not db.one("SELECT hostel_id FROM hostel WHERE hostel_id=:id AND hostel_status='ACTIVE'",dict(id=f['hostel_id'])):
                             raise RuleError('Choose an active hostel.')
-                        db.write("INSERT INTO student VALUES(:id,:name,:program,:year,:hostel,:room,'ACTIVE')",dict(id=f['student_id'].strip().upper()[:12],name=f['name'].strip()[:80],program=f['program'].strip()[:60],year=year,hostel=f['hostel_id'],room=f['room'].strip()[:20]))
+                        db.write("INSERT INTO student VALUES(:id,:name,:program,:year,:hostel,:room,'ACTIVE')",dict(id=f['student_id'].strip().upper(),name=f['name'].strip(),program=f['program'].strip(),year=year,hostel=f['hostel_id'],room=f['room'].strip()))
                     elif kind=='staff':
                         role=f['role']
                         if role not in ('ADMIN','LIBRARY_STAFF','HOSTEL_STAFF'):
                             raise RuleError('Choose a valid staff role.')
-                        db.write("INSERT INTO staff VALUES(:id,:name,:role,:hostel,:username,'Y')",dict(id=f['staff_id'].strip().upper()[:10],name=f['name'].strip()[:80],role=role,hostel=f['hostel_id'] if role=='HOSTEL_STAFF' else None,username=f['username'].strip()[:40]))
+                        db.write("INSERT INTO staff VALUES(:id,:name,:role,:hostel,:username,'Y')",dict(id=f['staff_id'].strip().upper(),name=f['name'].strip(),role=role,hostel=f['hostel_id'] if role=='HOSTEL_STAFF' else None,username=f['username'].strip()))
                     else:
                         raise RuleError('Unknown record type.')
+                    if kind=='student':
+                        demo_account(db,f['student_id'].strip(),'student',f['student_id'].strip().upper())
+                    elif kind=='staff':
+                        demo_account(db,f['username'].strip(),'staff',f['staff_id'].strip().upper())
+                    security_audit(db,'RECORD_CREATED',g.user['username'],kind,f[kind+'_id'].strip().upper())
                 flash('Reference record added.','success')
                 return redirect(url_for('records'))
             except (ValueError,KeyError,sqlite3.IntegrityError) as err:
@@ -340,11 +414,23 @@ def create_app(test_config=None):
             staff=db.rows('SELECT * FROM staff ORDER BY staff_id')
         return render_template('records.html',hostels=hostels,students=students,staff=staff)
 
+    from nightlibrary.admin import register_admin
+    register_admin(app,roles)
+
     @app.get('/health')
     def health():
-        with connect() as db:
-            db.one('SELECT COUNT(*) AS n FROM hostel')
-        return dict(status='ok',backend=app.config['DATABASE_BACKEND'],demo=app.config['DEMO_MODE'])
+        return dict(status='ok')
+
+    @app.get('/ready')
+    def readiness():
+        try:
+            with connect() as db:
+                version=db.one('SELECT version FROM app_migration WHERE version=2')
+                if not version or version['version']!=2:
+                    return dict(status='unavailable'),503
+            return dict(status='ready')
+        except Exception:
+            return dict(status='unavailable'),503
 
     return app
 

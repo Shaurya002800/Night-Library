@@ -11,7 +11,7 @@ FROM HOSTEL h
 LEFT JOIN STUDENT st ON st.hostel_id = h.hostel_id AND st.student_status = 'ACTIVE'
 GROUP BY h.hostel_name
 ORDER BY active_students DESC;
--- Q3. List currently active exit passes.
+-- Q3. Stored ACTIVE passes; FN_CHECK_PASS_STATUS evaluates time-aware validity.
 SELECT pass_id, pass_token, issued_at, expiry_time, pass_status
 FROM EXIT_PASS
 WHERE pass_status = 'ACTIVE'
@@ -107,7 +107,7 @@ FROM NIGHT_ATTENDANCE na
 JOIN STUDENT st ON st.student_id = na.student_id
 JOIN HOSTEL h ON h.hostel_id = st.hostel_id
 LEFT JOIN EXIT_PASS ep ON ep.attendance_id = na.attendance_id
-LEFT JOIN HOSTEL_RETURN hr ON hr.pass_id = ep.pass_id
+LEFT JOIN HOSTEL_RETURN hr ON hr.pass_id = ep.pass_id AND hr.verification_status = 'VERIFIED'
 WHERE na.attendance_status IN ('PRESENT', 'LATE')
 AND hr.return_id IS NULL
 GROUP BY h.hostel_name
@@ -119,7 +119,7 @@ COUNT(DISTINCT hr.return_id) AS verified_returns
 FROM LIBRARY_SESSION ls
 LEFT JOIN NIGHT_ATTENDANCE na ON na.session_id = ls.session_id
 LEFT JOIN EXIT_PASS ep ON ep.attendance_id = na.attendance_id
-LEFT JOIN HOSTEL_RETURN hr ON hr.pass_id = ep.pass_id
+LEFT JOIN HOSTEL_RETURN hr ON hr.pass_id = ep.pass_id AND hr.verification_status = 'VERIFIED'
 GROUP BY ls.session_id
 ORDER BY ls.session_id;
 -- Q16. Students who have not attended the latest open session.
@@ -145,7 +145,7 @@ ORDER BY al.action_time DESC;
 SELECT pass_id, pass_token, pass_status, expiry_time
 FROM EXIT_PASS
 WHERE pass_status = 'EXPIRED'
-OR (pass_status = 'ACTIVE' AND expiry_time < SYSTIMESTAMP)
+OR (pass_status = 'ACTIVE' AND expiry_time < LOCALTIMESTAMP)
 ORDER BY expiry_time;
 -- Q19. Hostel verification workload by staff member.
 SELECT sf.staff_id, sf.staff_name, sf.hostel_id, COUNT(hr.return_id) AS verified_returns
